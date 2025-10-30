@@ -1,0 +1,7 @@
+Enc(pk_j, ek_i) → implemented as ecc_encrypt(pk_j, ek_i) returning ephemeral_pub, nonce, ciphertext. The recipient uses its private key to recover ek_i.
+
+E(ek_j, ek_i) → implemented as aes_gcm_encrypt(ek_i, ek_j) (encrypt ek_j under key ek_i).
+
+EdgeAdd(i,j) payload is the JSON produced by make_edge_add_payload(...). That JSON is what you should store on-chain in the publishEdgeLabel(...) contract call.
+
+Derive is implemented by reading chain labels and running ecc_decrypt followed by aes_gcm_decrypt as done in decode_edge_add_payload_for_target.

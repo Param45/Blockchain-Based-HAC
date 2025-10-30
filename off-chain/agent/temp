@@ -1,0 +1,644 @@
+project Structure:
+
+besu-hac/
+|---agent/
+    |---config/
+    |    |---network.js        # RPC endpoint, chainId, contract address
+    |    |---roles.js          # Map addresses to roles (Director/Professor/Student)
+    |
+    |---crypto/
+    |    |---signing.js        # Optional: signing transactions if needed
+    |    |---keys.js           # Wrapper around crypto-engine key_manager
+    |    |---payload.js        # Wrapper around edge_ops functions
+    |
+    |---contracts/
+    |    |---hac.js            # Contract interaction wrapper using ethers.js
+    |
+    |---listeners/
+    |    |---events.js       # Listen to KeyRegistered, EdgePublished, KeyRotated
+    |
+    |---transactions/
+    |    |---registerKey.js    # Function to register public key
+    |    |---publishEdge.js    # Function to submit EdgeLabel
+    |    |---deleteEdge.js     # Function to soft-delete edge
+    |    |---rotateKey.js      # Function to rotate key
+    |
+    |---index.js               # CLI / main entrypoint
+    |---crypto_engine_wrapper.py       
+|---artifacts
+|---cache
+|---contracts
+|---crypto-engine\
+    |---keys\(currently empty)
+    |---aes_gcm.py
+    |---ecc_elgamal.py
+    |---edge_ops.py
+    |---hash_modulehash_module.py
+    |---key_manager.py
+|---node_modules\
+|---modules\
+    |---deploy.js
+|---hardhat.cofig.js
+|---package.json
+|---package-lock.json
+
+     
+
+# aes_gcm.py:
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import os
+from typing import Tuple
+
+def aes_gcm_encrypt(key: bytes, plaintext: bytes, associated_data: bytes = None) -> Tuple[bytes, bytes]:
+    """
+    Returns (nonce || ciphertext || tag, nonce) or more clearly (ciphertext_bundle, nonce)
+    We'll return (nonce, ciphertext) separately for easier packaging.
+    """
+    if len(key) not in (16, 24, 32):
+        raise ValueError("AES key must be 128/192/256 bits")
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    ct = aesgcm.encrypt(nonce, plaintext, associated_data)
+    return nonce, ct
+
+def aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, associated_data: bytes = None) -> bytes:
+    aesgcm = AESGCM(key)
+    return aesgcm.decrypt(nonce, ciphertext, associated_data)
+
+
+
+
+# ecc_elgamal.py:
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import constant_time
+from cryptography.hazmat.backends import default_backend
+from typing import Tuple
+import os
+from aes_gcm import aes_gcm_encrypt, aes_gcm_decrypt
+
+# We'll use SECP256R1 by default (changeable)
+CURVE = ec.SECP256R1()
+
+def generate_keypair() -> Tuple[ec.EllipticCurvePrivateKey, bytes]:
+    priv = ec.generate_private_key(CURVE, default_backend())
+    pub_bytes = pubkey_bytes_from_private(priv)
+    return priv, pub_bytes
+
+def pubkey_bytes_from_private(priv: ec.EllipticCurvePrivateKey) -> bytes:
+    pub = priv.public_key()
+    return pub.public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.UncompressedPoint
+    )
+
+def load_private_from_scalar_hex(ski_hex: str) -> ec.EllipticCurvePrivateKey:
+    """
+    Create an EC private key object from a user-supplied scalar (hex string).
+    Warning: This assumes the scalar is valid for the chosen curve.
+    """
+    d = int(ski_hex, 16)
+    # construct private numbers
+    return ec.derive_private_key(d, CURVE, default_backend())
+
+def load_public_from_bytes(pub_bytes: bytes) -> ec.EllipticCurvePublicKey:
+    return ec.EllipticCurvePublicKey.from_encoded_point(CURVE, pub_bytes)
+
+def _derive_symmetric_from_shared(shared: bytes, info: bytes = b"ecies-encryption", length: int = 32) -> bytes:
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=length,
+        salt=None,
+        info=info,
+        backend=default_backend()
+    )
+    return hkdf.derive(shared)
+
+def ecc_encrypt(recipient_pub_bytes: bytes, plaintext: bytes, associated_data: bytes = None) -> dict:
+    """
+    ECIES-like encryption:
+    - generate ephemeral privKey e
+    - compute shared = ecdh(e, recipient_pub)
+    - derive symmetric key K = HKDF(shared)
+    - ciphertext = AES-GCM(K, plaintext)
+    Return a dict: { 'ephemeral_pub': bytes, 'nonce': bytes, 'ciphertext': bytes }
+    """
+    recipient_pub = load_public_from_bytes(recipient_pub_bytes)
+    eph_priv = ec.generate_private_key(CURVE, default_backend())
+    shared = eph_priv.exchange(ec.ECDH(), recipient_pub)  # bytes
+    sym = _derive_symmetric_from_shared(shared)
+    nonce, ct = aes_gcm_encrypt(sym, plaintext, associated_data)
+    eph_pub_bytes = pubkey_bytes_from_private(eph_priv)
+    return {"ephemeral_pub": eph_pub_bytes, "nonce": nonce, "ciphertext": ct}
+
+def ecc_decrypt(recipient_priv: ec.EllipticCurvePrivateKey, package: dict, associated_data: bytes = None) -> bytes:
+    """
+    package contains ephemeral_pub, nonce, ciphertext
+    """
+    eph_pub = load_public_from_bytes(package["ephemeral_pub"])
+    shared = recipient_priv.exchange(ec.ECDH(), eph_pub)
+    sym = _derive_symmetric_from_shared(shared)
+    return aes_gcm_decrypt(sym, package["nonce"], package["ciphertext"], associated_data)
+
+
+
+# edge_ops.py
+import json
+from ecc_elgamal import ecc_encrypt, ecc_decrypt
+from aes_gcm import aes_gcm_encrypt, aes_gcm_decrypt
+from typing import Dict
+
+def make_edge_add_payload(entity_from_id: str, entity_to_pub_bytes: bytes, ek_from: bytes, ek_to: bytes):
+    """
+    Create the tuple described in paper:
+    - Enc(pk_to, ek_from)        -> ECC encrypt ek_from under pk_to
+    - E(ek_to, ek_from)          -> AES encrypt ek_to under ek_from
+    We'll return a JSON-serializable dict with base hex strings.
+    """
+    # 1. Enc(pk_to, ek_from)
+    enc_pk_to = ecc_encrypt(entity_to_pub_bytes, ek_from)
+    # 2. E(ek_to, ek_from)  -> AES-GCM encrypt ek_to with ek_from as key
+    nonce, ct = aes_gcm_encrypt(ek_from, ek_to)
+    payload = {
+        "from": entity_from_id,
+        "enc_pk_to": {
+            "ephemeral_pub_hex": enc_pk_to["ephemeral_pub"].hex(),
+            "nonce_hex": enc_pk_to["nonce"].hex(),
+            "ciphertext_hex": enc_pk_to["ciphertext"].hex()
+        },
+        "e_under": {
+            "nonce_hex": nonce.hex(),
+            "ciphertext_hex": ct.hex()
+        }
+    }
+    return payload
+
+def decode_edge_add_payload_for_target(recipient_priv_obj, payload: Dict):
+    """
+    Recipient (target) uses its private key to decrypt Enc(pk_to, ek_from)
+    and obtains ek_from. Then can decrypt E(ek_to, ek_from) with ek_from to get ek_to.
+    """
+    enc_pk_to = {
+        "ephemeral_pub": bytes.fromhex(payload["enc_pk_to"]["ephemeral_pub_hex"]),
+        "nonce": bytes.fromhex(payload["enc_pk_to"]["nonce_hex"]),
+        "ciphertext": bytes.fromhex(payload["enc_pk_to"]["ciphertext_hex"])
+    }
+    ek_from = ecc_decrypt(recipient_priv_obj, enc_pk_to)
+    e_under_nonce = bytes.fromhex(payload["e_under"]["nonce_hex"])
+    e_under_ct = bytes.fromhex(payload["e_under"]["ciphertext_hex"])
+    ek_to = aes_gcm_decrypt(ek_from, e_under_nonce, e_under_ct)
+    return ek_from, ek_to
+
+
+# hash_module.py
+import hashlib
+
+def sha256(data: bytes) -> bytes:
+    """
+    Return SHA-256 digest of data.
+    """
+    return hashlib.sha256(data).digest()
+
+def sha256_hex(data: bytes) -> str:
+    return sha256(data).hex()
+
+
+# key_manager.py
+import os, json
+from typing import Tuple
+from hash_module import sha256
+from ecc_elgamal import generate_keypair, pubkey_bytes_from_private, load_private_from_scalar_hex
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+
+KEYSTORE_DIR = "keys"
+
+def ensure_keystore_dir():
+    os.makedirs(KEYSTORE_DIR, exist_ok=True)
+
+def save_entity_keys(entity_id: str, priv_obj, pub_bytes: bytes, ek: bytes):
+    ensure_keystore_dir()
+    path = os.path.join(KEYSTORE_DIR, f"{entity_id}.json")
+    # Store priv as hex of private numbers (not secure for production — use HSM)
+    priv_num = priv_obj.private_numbers().private_value
+    data = {
+        "entity_id": entity_id,
+        "priv_scalar_hex": format(priv_num, "x"),
+        "pub_hex": pub_bytes.hex(),
+        "ek_hex": ek.hex()
+    }
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+def load_entity_keys(entity_id: str):
+    path = os.path.join(KEYSTORE_DIR, f"{entity_id}.json")
+    with open(path, "r") as f:
+        data = json.load(f)
+    return data
+
+def derive_ek_from_ski(ski_hex: str, entity_id: str, length: int = 32) -> bytes:
+    """
+    Deterministically derive a symmetric ek from user-supplied ski and entity id.
+    Use HKDF with SHA-256 on the raw scalar bytes.
+    """
+    d = int(ski_hex, 16)
+    raw = d.to_bytes((d.bit_length() + 7) // 8, byteorder="big")
+    info = entity_id.encode() + b":ek"
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=length, salt=None, info=info)
+    return hkdf.derive(raw)
+
+def keygen_from_user_ski(entity_id: str, ski_hex: str = None) -> Tuple:
+    """
+    If ski_hex is provided, use it to form private key; otherwise generate new.
+    Returns (priv_obj, pub_bytes, ek_bytes)
+    """
+    if ski_hex:
+        priv = load_private_from_scalar_hex(ski_hex)
+        pub_bytes = pubkey_bytes_from_private(priv)
+    else:
+        priv, pub_bytes = generate_keypair()
+    # ephemeral ek can be derived deterministically from ski or randomly
+    if ski_hex:
+        ek = derive_ek_from_ski(ski_hex, entity_id)
+    else:
+        ek = os.urandom(32)
+    return priv, pub_bytes, ek
+
+def export_pub_hex(pub_bytes: bytes) -> str:
+    return pub_bytes.hex()
+
+
+
+# hardhat.config.js
+// Hardhat configuration for Hyperledger Besu QBFT private network
+
+require("@nomiclabs/hardhat-ethers"); // Enables ethers.js plugin
+
+// === Besu Network Configuration ===
+// Replace the RPC URL if your Besu node runs on a different host or port.
+const BESU_RPC_URL = "http://localhost:8545";
+
+// Private key of the deployer (director in your genesis alloc)
+const DEPLOYER_PRIVATE_KEY = "0x5ac1236830e93e924bec20f4bd885b2ebfd4a24e0458f4e3d2ad2642fdc7b523";
+
+// QBFT network chain ID (from your genesis config)
+const CHAIN_ID = 1337;
+
+module.exports = {
+  solidity: {
+    version: "0.8.19",
+    settings: {
+      optimizer: {
+        enabled: true,
+        runs: 200,
+      },
+    },
+  },
+  defaultNetwork: "besu",
+  networks: {
+    besu: {
+      url: BESU_RPC_URL,
+      chainId: CHAIN_ID,
+      accounts: [DEPLOYER_PRIVATE_KEY],
+      gasPrice: 0,           // Besu private networks often run with 0 gas price
+      gas: "auto",           // let Hardhat estimate gas
+      timeout: 200000,       // prevent deployment timeout
+    },
+  },
+};
+
+
+# In the besu folder (The one that has the blockchain setup)
+# qbftConfigFile.json
+{
+  "genesis": {
+    "config": {
+      "chainId": 1337,
+      "berlinBlock": 0,
+      "qbft": {
+        "blockperiodseconds": 2,
+        "epochlength": 30000,
+        "requesttimeoutseconds": 4
+      }
+    },
+    "nonce": "0x0",
+    "timestamp": "0x58ee40ba",
+    "gasLimit": "0x47b760",
+    "difficulty": "0x1",
+    "mixHash": "0x63746963616c2062797a616e74696e65206661756c7420746f6c6572616e6365",
+    "coinbase": "0x0000000000000000000000000000000000000000",
+    "alloc": {
+      "0x1111111111111111111111111111111111111111": {
+        "comment": "Director",
+        "balance": "0x8AC7230489E80000"
+      },
+      "0x2222222222222222222222222222222222222222": {
+        "comment": "Professor 1",
+        "balance": "0x8AC7230489E80000"
+      },
+      "0x3333333333333333333333333333333333333333": {
+        "comment": "Professor 2",
+        "balance": "0x8AC7230489E80000"
+      },
+      "0x4444444444444444444444444444444444444444": {
+        "comment": "Student 1 (under Professor 1)",
+        "balance": "0x8AC7230489E80000"
+      },
+      "0x5555555555555555555555555555555555555555": {
+        "comment": "Student 2 (under Professor 2)",
+        "balance": "0x8AC7230489E80000"
+      },
+      "0x6666666666666666666666666666666666666666": {
+        "comment": "Student 3 (common to both professors)",
+        "balance": "0x8AC7230489E80000"
+      }
+    }
+  },
+  "blockchain": {
+    "nodes": {
+      "generate": true,
+      "count": 6,
+      "names": [
+        "Director",
+        "Professor1",
+        "Professor2",
+        "Student1",
+        "Student2",
+        "Student3"
+      ]
+    }
+  }
+}
+
+
+# genesis.json
+{
+  "config" : {
+    "chainId" : 1337,
+    "berlinBlock" : 0,
+    "qbft" : {
+      "blockperiodseconds" : 2,
+      "epochlength" : 30000,
+      "requesttimeoutseconds" : 4
+    }
+  },
+  "nonce" : "0x0",
+  "timestamp" : "0x58ee40ba",
+  "gasLimit" : "0x47b760",
+  "difficulty" : "0x1",
+  "mixHash" : "0x63746963616c2062797a616e74696e65206661756c7420746f6c6572616e6365",
+  "coinbase" : "0x0000000000000000000000000000000000000000",
+  "alloc" : {
+    "0x1111111111111111111111111111111111111111" : {
+      "comment" : "Director",
+      "balance" : "0x8AC7230489E80000"
+    },
+    "0x2222222222222222222222222222222222222222" : {
+      "comment" : "Professor 1",
+      "balance" : "0x8AC7230489E80000"
+    },
+    "0x3333333333333333333333333333333333333333" : {
+      "comment" : "Professor 2",
+      "balance" : "0x8AC7230489E80000"
+    },
+    "0x4444444444444444444444444444444444444444" : {
+      "comment" : "Student 1 (under Professor 1)",
+      "balance" : "0x8AC7230489E80000"
+    },
+    "0x5555555555555555555555555555555555555555" : {
+      "comment" : "Student 2 (under Professor 2)",
+      "balance" : "0x8AC7230489E80000"
+    },
+    "0x6666666666666666666666666666666666666666" : {
+      "comment" : "Student 3 (common to both professors)",
+      "balance" : "0x8AC7230489E80000"
+    }
+  },
+  "extraData" : "0xf8a4a00000000000000000000000000000000000000000000000000000000000000000f87e94733123064c38bfb70f939f4763e359e0d512b9ba948e6410e5c1c433d9c545025d7bd21f780605c81f94cf9d739f438c36bd6e769595cdf4794dc84996c3944bdbbfd674ee2ed57db4d058ed5ca04b858ef4619408f20e403b2813a326221781d4420242a5db452b946681d6eb6128f6ef8e0792ca53271f7a5c84873bc080c0"
+}
+
+
+# smart contract:
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+/// @title Hierarchical Access Control Registry
+/// @notice Stores public keys and versioned encrypted edge labels for an off-chain cryptographic hierarchy.
+/// @dev All heavy cryptography happens off-chain. This contract stores bytes and emits events for agents.
+contract HierarchicalAccessControl {
+
+    /// @notice Public key published by an entity (address => pubkey bytes)
+    mapping(address => bytes) public pubKeys;
+
+    /// @notice EdgeLabel stores the encrypted tuples and metadata for an edge from -> to
+    struct EdgeLabel {
+        address from;        // publisher
+        address to;          // recipient
+        bytes enc_pk_to;     // Enc(pk_to, ek_from)  (ECIES-style bytes)
+        bytes e_under;       // E(ek_to, ek_from)   (AES-GCM bytes)
+        uint64 version;      // version number set by publisher
+        uint256 timestamp;   // block timestamp when published
+        bool deleted;        // soft-delete flag
+    }
+
+    // mapping: from => to => array of versioned EdgeLabel entries
+    mapping(address => mapping(address => EdgeLabel[])) private edges;
+
+    /// @notice Emitted when an entity registers or updates its public key
+    event KeyRegistered(address indexed who, bytes pubKey, uint256 timestamp);
+
+    /// @notice Emitted when an edge label is published (EdgeAdd)
+    event EdgePublished(
+        address indexed from,
+        address indexed to,
+        bytes enc_pk_to,
+        bytes e_under,
+        uint64 version,
+        uint256 timestamp
+    );
+
+    /// @notice Emitted when an edge label is soft-deleted
+    event EdgeDeleted(address indexed from, address indexed to, uint64 version, uint256 timestamp);
+
+    /// @notice Emitted when a key rotation is announced (publisher changes public key)
+    event KeyRotated(address indexed who, bytes newPubKey, uint64 newVersion, uint256 timestamp);
+
+    // -------------------------
+    // Key management functions
+    // -------------------------
+
+    /// @notice Register or update your public key bytes.
+    /// @param pubKey The public key bytes (curve point encoding or other format)
+    function registerPublicKey(bytes calldata pubKey) external {
+        require(pubKey.length > 0, "pubKey-empty");
+        pubKeys[msg.sender] = pubKey;
+        emit KeyRegistered(msg.sender, pubKey, block.timestamp);
+    }
+
+    /// @notice Convenience getter to check whether a pubkey exists for an address.
+    /// @param who address to query
+    /// @return exists true if pubKey exists and non-empty
+    function hasPubKey(address who) public view returns (bool exists) {
+        return pubKeys[who].length > 0;
+    }
+
+    // -------------------------
+    // Edge publish / delete
+    // -------------------------
+
+    /// @notice Publish an EdgeLabel (EdgeAdd). `msg.sender` is the publisher ("from").
+    /// @param to Recipient address (the entity whose key is used in enc_pk_to)
+    /// @param enc_pk_to Enc(pk_to, ek_from) - bytes from your off-chain crypto engine
+    /// @param e_under   E(ek_to, ek_from) - bytes from your off-chain crypto engine
+    /// @param version   Version number set by the publisher (increment as you rotate)
+    function publishEdge(
+        address to,
+        bytes calldata enc_pk_to,
+        bytes calldata e_under,
+        uint64 version
+    ) external {
+        require(to != address(0), "to-zero");
+        require(enc_pk_to.length > 0, "enc_pk_to-empty");
+        require(e_under.length > 0, "e_under-empty");
+        require(hasPubKey(to), "to-no-pubkey");       // recipient must have published a public key
+        require(hasPubKey(msg.sender), "from-no-pubkey"); // publisher should have registered their pubkey (optional but recommended)
+
+        EdgeLabel memory el = EdgeLabel({
+            from: msg.sender,
+            to: to,
+            enc_pk_to: enc_pk_to,
+            e_under: e_under,
+            version: version,
+            timestamp: block.timestamp,
+            deleted: false
+        });
+
+        edges[msg.sender][to].push(el);
+
+        emit EdgePublished(msg.sender, to, enc_pk_to, e_under, version, block.timestamp);
+    }
+
+    /// @notice Mark the latest label of (msg.sender -> to) as deleted (soft delete). Optionally specify version to delete.
+    /// Only the original publisher may delete.
+    /// @param to Recipient address
+    /// @param version Version to mark deleted. If set to `type(uint64).max`, delete the latest version.
+    function deleteEdge(address to, uint64 version) external {
+        require(to != address(0), "to-zero");
+        EdgeLabel[] storage arr = edges[msg.sender][to];
+        require(arr.length > 0, "no-edge");
+
+        uint256 idx;
+        bool found = false;
+        if (version == type(uint64).max) {
+            idx = arr.length - 1;
+            found = !arr[idx].deleted;
+        } else {
+            // search for the matching version from the end (most recent first)
+            for (uint256 i = arr.length; i > 0; --i) {
+                uint256 j = i - 1;
+                if (arr[j].version == version) {
+                    idx = j;
+                    found = !arr[j].deleted;
+                    break;
+                }
+            }
+        }
+        require(found, "version-not-found-or-already-deleted");
+
+        arr[idx].deleted = true;
+        emit EdgeDeleted(msg.sender, to, arr[idx].version, block.timestamp);
+    }
+
+    // -------------------------
+    // Key rotation helper
+    // -------------------------
+
+    /// @notice Rotate your public key and emit KeyRotated event (for off-chain agents to respond).
+    /// You should also republish new edge labels after rotating keys as required by your protocol.
+    /// @param newPubKey The new public key bytes
+    /// @param newVersion A monotonic version number representing this rotation
+    function rotateKey(bytes calldata newPubKey, uint64 newVersion) external {
+        require(newPubKey.length > 0, "newPubKey-empty");
+        pubKeys[msg.sender] = newPubKey;
+        emit KeyRotated(msg.sender, newPubKey, newVersion, block.timestamp);
+    }
+
+    // -------------------------
+    // Read helpers
+    // -------------------------
+
+    /// @notice Get the number of versions stored for a given (from -> to) pair.
+    function getEdgeCount(address from, address to) external view returns (uint256) {
+        return edges[from][to].length;
+    }
+
+    /// @notice Get a specific EdgeLabel (by index) for a (from -> to) pair.
+    /// @param from Publisher address
+    /// @param to Recipient address
+    /// @param index Index in the version array (0 = oldest)
+    /// @return from_ Publisher address
+    /// @return to_ Recipient address
+    /// @return enc_pk_to Encrypted pk_to bytes
+    /// @return e_under Encrypted ek bytes
+    /// @return version Version of the edge
+    /// @return timestamp Timestamp of creation
+    /// @return deleted Soft-delete flag
+    function getEdgeByIndex(address from, address to, uint256 index)
+        external
+        view
+        returns (
+            address from_,
+            address to_,
+            bytes memory enc_pk_to,
+            bytes memory e_under,
+            uint64 version,
+            uint256 timestamp,
+            bool deleted
+        )
+    {
+        require(index < edges[from][to].length, "index-oob");
+        EdgeLabel storage el = edges[from][to][index];
+        return (el.from, el.to, el.enc_pk_to, el.e_under, el.version, el.timestamp, el.deleted);
+    }
+
+    /// @notice Get the latest (most recent) EdgeLabel for a (from -> to) pair.
+    /// @param from Publisher address
+    /// @param to Recipient address
+    /// @return from_ Publisher address
+    /// @return to_ Recipient address
+    /// @return enc_pk_to Encrypted pk_to bytes
+    /// @return e_under Encrypted ek bytes
+    /// @return version Version of the edge
+    /// @return timestamp Timestamp of creation
+    /// @return deleted Soft-delete flag
+    function getLatestEdge(address from, address to)
+        external
+        view
+        returns (
+            address from_,
+            address to_,
+            bytes memory enc_pk_to,
+            bytes memory e_under,
+            uint64 version,
+            uint256 timestamp,
+            bool deleted
+        )
+    {
+        uint256 len = edges[from][to].length;
+        require(len > 0, "no-edge");
+        EdgeLabel storage el = edges[from][to][len - 1];
+        return (el.from, el.to, el.enc_pk_to, el.e_under, el.version, el.timestamp, el.deleted);
+    }
+
+    /// @notice Convenience: read the public key for an address.
+    function getPubKey(address who) external view returns (bytes memory) {
+        return pubKeys[who];
+    }
+}
+
+
+
+
+  
