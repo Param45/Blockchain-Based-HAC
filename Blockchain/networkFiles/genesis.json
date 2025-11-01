@@ -1,0 +1,44 @@
+{
+  "config" : {
+    "chainId" : 1337,
+    "berlinBlock" : 0,
+    "qbft" : {
+      "blockperiodseconds" : 2,
+      "epochlength" : 30000,
+      "requesttimeoutseconds" : 4
+    }
+  },
+  "nonce" : "0x0",
+  "timestamp" : "0x58ee40ba",
+  "gasLimit" : "0x47b760",
+  "difficulty" : "0x1",
+  "mixHash" : "0x63746963616c2062797a616e74696e65206661756c7420746f6c6572616e6365",
+  "coinbase" : "0x0000000000000000000000000000000000000000",
+  "alloc" : {
+    "0x1111111111111111111111111111111111111111" : {
+      "comment" : "Director",
+      "balance" : "0x8AC7230489E80000"
+    },
+    "0x2222222222222222222222222222222222222222" : {
+      "comment" : "Professor 1",
+      "balance" : "0x8AC7230489E80000"
+    },
+    "0x3333333333333333333333333333333333333333" : {
+      "comment" : "Professor 2",
+      "balance" : "0x8AC7230489E80000"
+    },
+    "0x4444444444444444444444444444444444444444" : {
+      "comment" : "Student 1 (under Professor 1)",
+      "balance" : "0x8AC7230489E80000"
+    },
+    "0x5555555555555555555555555555555555555555" : {
+      "comment" : "Student 2 (under Professor 2)",
+      "balance" : "0x8AC7230489E80000"
+    },
+    "0x6666666666666666666666666666666666666666" : {
+      "comment" : "Student 3 (common to both professors)",
+      "balance" : "0x8AC7230489E80000"
+    }
+  },
+  "extraData" : "0xf8a4a00000000000000000000000000000000000000000000000000000000000000000f87e94733123064c38bfb70f939f4763e359e0d512b9ba948e6410e5c1c433d9c545025d7bd21f780605c81f94cf9d739f438c36bd6e769595cdf4794dc84996c3944bdbbfd674ee2ed57db4d058ed5ca04b858ef4619408f20e403b2813a326221781d4420242a5db452b946681d6eb6128f6ef8e0792ca53271f7a5c84873bc080c0"
+}
