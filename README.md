@@ -31,13 +31,12 @@ Blockchain-Based-HAC/
 │   ├── genesis.json         # Blockchain custom genesis configuration
 │   ├── qbftConfigFile.json  # QBFT consensus parameters
 │   └── [node directories]   # Configuration and local state for each simulated node
-├── off-chain/               # Smart contracts, edge computations, and deployment scripts 
-│   ├── contracts/           # Solidity smart contracts for access control 
-│   ├── scripts/             # Deployment and interaction scripts
-│   ├── crypto-engine/       # Cryptographic module for key derivation and AES/ECC operations
-│   ├── hardhat.config.js    # Hardhat Environment Configuration
-│   └── package.json         # Node.js dependencies
-└── Research Paper.pdf       # Detailed theoretical foundations and performance analysis
+└── off-chain/               # Smart contracts, edge computations, and deployment scripts 
+    ├── contracts/           # Solidity smart contracts for access control 
+    ├── scripts/             # Deployment and interaction scripts
+    ├── crypto-engine/       # Cryptographic module for key derivation and AES/ECC operations
+    ├── hardhat.config.js    # Hardhat Environment Configuration
+    └── package.json         # Node.js dependencies
 ```
 
 ## 🛠️ Prerequisites
